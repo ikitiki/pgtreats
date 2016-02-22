@@ -36,14 +36,14 @@
 #include "utils/tqual.h"
 #include "utils/rel.h"
 #include "catalog/pg_type.h"
-#include "access/tupconvert.h"
+#include "access/htup_details.h"
 
 typedef struct
 {
     Relation            rel;
     HeapScanDesc        scan;
     TupleDesc           reltupdesc;
-    TupleConversionMap  *map;
+    TupleDesc           tupdesc;
 } pg_dirtyread_ctx;
 
 PG_MODULE_MAGIC;
@@ -74,9 +74,22 @@ pg_dirtyread(PG_FUNCTION_ARGS)
             usr_ctx->reltupdesc = RelationGetDescr(usr_ctx->rel);
             get_call_result_type(fcinfo, NULL, &tupdesc);
             funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-            usr_ctx->map = convert_tuples_by_position(usr_ctx->reltupdesc, funcctx->tuple_desc, "Error converting tuple descriptors!");
             usr_ctx->scan = heap_beginscan(usr_ctx->rel, SnapshotAny, 0, NULL);
+            usr_ctx->tupdesc = tupdesc;
             funcctx->user_fctx = (void *) usr_ctx;
+
+            if (usr_ctx->tupdesc->natts != usr_ctx->reltupdesc->natts
+                && usr_ctx->tupdesc->natts != usr_ctx->reltupdesc->natts + 2)
+            {
+                elog(
+                    ERROR,
+                    "Number of returned columns (%d) does not match expected column count (%d or %d).",
+                    usr_ctx->tupdesc->natts,
+                    usr_ctx->reltupdesc->natts,
+                    usr_ctx->reltupdesc->natts + 2
+                );
+            }
+
             MemoryContextSwitchTo(oldcontext);
         }
     }
@@ -86,7 +99,31 @@ pg_dirtyread(PG_FUNCTION_ARGS)
 
     if ((tuplein = heap_getnext(usr_ctx->scan, ForwardScanDirection)) != NULL)
     {
-        tupleout = do_convert_tuple(tuplein, usr_ctx->map);
+        int natts = usr_ctx->tupdesc->natts;
+        int tnatts = usr_ctx->reltupdesc->natts;
+
+        Datum *odvalues = (Datum *) palloc((tnatts + 1) * sizeof(Datum));
+        bool *onulls = (bool *) palloc((tnatts + 1) * sizeof(bool));
+
+        Datum *dvalues = (Datum *) palloc(natts * sizeof(Datum));
+        bool *nulls = (bool *) palloc(natts * sizeof(bool));
+
+        heap_deform_tuple(tuplein, usr_ctx->reltupdesc, odvalues + 1, onulls + 1);
+
+        for (int i = 0; i < natts; i++) {
+            if (i < tnatts) {
+                dvalues[i] = odvalues[i + 1];
+                nulls[i] = onulls[i + 1];
+            } else if (i == natts - 2) {
+                dvalues[i] = UInt32GetDatum(HeapTupleHeaderGetRawXmin(tuplein->t_data));
+                nulls[i] = false;
+            } else if (i == natts - 1) {
+                dvalues[i] = UInt32GetDatum(HeapTupleHeaderGetRawXmax(tuplein->t_data));
+                nulls[i] = false;
+            }
+        }
+
+        tupleout = heap_form_tuple(usr_ctx->tupdesc, dvalues, nulls);
         SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tupleout));
     }
     else

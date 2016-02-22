@@ -37,4 +37,10 @@ Using
 
     SELECT * FROM pg_dirtyread('foo'::regclass) as t(bar bigint, baz text);
 
+or
+
+    SELECT * FROM pg_dirtyread('foo'::regclass) as t(bar bigint, baz text, xmin bigint, xmax bigint);
+
+to get xmin and xmax values
+
 Where the schema of `foo` is `(bar bigint, baz text)`.
